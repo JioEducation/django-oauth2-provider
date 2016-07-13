@@ -4,9 +4,13 @@ from django.http import HttpResponse
 from django.http import HttpResponseRedirect, QueryDict
 from django.utils.translation import ugettext as _
 from django.views.generic.base import TemplateView
+from django.contrib.auth.models import User
 from django.core.exceptions import ObjectDoesNotExist
+from django.utils.crypto import get_random_string
 from oauth2.models import Client
 from . import constants, scope
+
+from common.seco_middleware import SecoApiMiddleware
 
 
 class OAuthError(Exception):
@@ -580,30 +584,104 @@ class AccessToken(OAuthView, Mixin):
         """
         As per :rfc:`3.2` the token endpoint *only* supports POST requests.
         """
-        if constants.ENFORCE_SECURE and not request.is_secure():
-            return self.error_response({
-                'error': 'invalid_request',
-                'error_description': _("A secure connection is required.")})
+        # Login implementation for Jio user on mobile
 
-        if not 'grant_type' in request.POST:
-            return self.error_response({
-                'error': 'invalid_request',
-                'error_description': _("No 'grant_type' included in the "
-                    "request.")})
+        request.POST = request.POST.copy()
+        jioid = request.POST['username']
+        password = request.POST['password']
 
-        grant_type = request.POST['grant_type']
+        form_data = {'identifier': jioid.strip(), 'password': password}
+        resp = SecoApiMiddleware.verify(form_data, 'verify')
+        idam_verify_response = resp[0]
+        status_code = resp[1]
+        if 'error_info' in idam_verify_response:
 
-        if grant_type not in self.grant_types:
-            return self.error_response({'error': 'unsupported_grant_type'})
+            error_data = idam_verify_response.get('error_info')
+            error_type = (error_data).get('error')
+            error_description = (error_data).get('value')
+            error_dict = {'error': error_type,
+                          'error_description': error_description}
+            return self.error_response(error_dict,
+                                       status_code if status_code else 200)
 
-        client = self.authenticate(request)
-
-        if client is None:
-            return self.error_response({'error': 'invalid_client'})
-
-        handler = self.get_handler(grant_type)
-
+        sso_token = idam_verify_response['ssoToken']
+        random_password = get_random_string(length=10,
+                                            allowed_chars='abcdefghjkmnpq\
+                                                           rstuvwxyzABCDEF\
+                                                           GHJKLMNPQRSTUVW\
+                                                           XYZ23456789')
         try:
-            return handler(request, request.POST, client)
-        except OAuthError, e:
-            return self.error_response(e.args[0])
+            db_result = self.authenticate_db_user(request,
+                                                  username=jioid,
+                                                  password=random_password)
+            handler = db_result[0]
+            client = db_result[1]
+            request = db_result[2]
+            try:
+                return handler(request, request.POST, client)
+            except OAuthError, e:
+                return self.error_response(e.args[0])
+
+        except User.DoesNotExist:
+
+            resp = SecoApiMiddleware.session_get(sso_token, 'session_get')
+            idam_user_details = resp[0]
+            status_code = resp[1]
+            if 'error_info' in idam_user_details:
+                error_data = idam_user_details.get('error_info')
+                error_type = (error_data).get('error')
+                error_description = (error_data).get('value')
+                error_dict = {'error': error_type,
+                              'error_description': error_description}
+                return self.error_response(error_dict,
+                                           status_code if status_code else 200)
+
+            user_data = idam_user_details['sessionAttributes']['user']
+            username = user_data['uid']
+            email = user_data['mail']
+            name = user_data['commonName']
+            error_dict = {"isJioUser": True,
+                          "username": username,
+                          "email": email,
+                          "name": name}
+            return self.error_response(error_dict,
+                                       status_code if status_code else 200)
+
+    def authenticate_db_user(self, request, **kwargs):
+        try:
+            username = kwargs.pop('username')
+            password = kwargs.pop('password')
+
+            user = User.objects.get(username=username)
+            user.set_password(password)
+            user.save(update_fields=['password'])
+
+            request.POST['password'] = password
+
+            if constants.ENFORCE_SECURE and not request.is_secure():
+                return self.error_response({
+                    'error': 'invalid_request',
+                    'error_description': _("A secure connection \
+                                            is required.")})
+
+            if not 'grant_type' in request.POST:
+                return self.error_response({
+                    'error': 'invalid_request',
+                    'error_description': _("No 'grant_type' \
+                                            included in the request.")})
+
+            grant_type = request.POST['grant_type']
+
+            if grant_type not in self.grant_types:
+                return self.error_response({'error': 'unsupported_grant_type'})
+
+            client = self.authenticate(request)
+
+            if client is None:
+                return self.error_response({'error': 'invalid_client'})
+
+            handler = self.get_handler(grant_type)
+            return handler, client, request
+
+        except User.DoesNotExist:
+            raise
